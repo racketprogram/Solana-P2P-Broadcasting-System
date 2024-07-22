@@ -14,7 +14,7 @@ This is a P2P broadcasting system built on the Solana blockchain. It uses libp2p
 
 To run the program, use the following command:
 ```bash
-go run main.go -wallet /path/to/your/wallet.json
+go run p2p.go -wallet /path/to/your/wallet.json
 ```
 Replace `/path/to/your/wallet.json` with the actual path to your Solana wallet JSON file.
 
