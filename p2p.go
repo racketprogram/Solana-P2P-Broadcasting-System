@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"flag"
 
 	"github.com/blocto/solana-go-sdk/client"
 	"github.com/blocto/solana-go-sdk/common"
@@ -38,52 +39,35 @@ type Node struct {
 	TransactionHashes []string
 }
 
-func NewNode() (*Node, error) {
-	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate key pair: %v", err)
-	}
+func NewNode(account types.Account) (*Node, error) {
+    priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate key pair: %v", err)
+    }
 
-	h, err := libp2p.New(
-		libp2p.Identity(priv),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
-		libp2p.Security(noise.ID, noise.New),
-		libp2p.Transport(tcp.NewTCPTransport),
-		libp2p.NATPortMap(),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create libp2p host: %v", err)
-	}
+    h, err := libp2p.New(
+        libp2p.Identity(priv),
+        libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+        libp2p.Security(noise.ID, noise.New),
+        libp2p.Transport(tcp.NewTCPTransport),
+        libp2p.NATPortMap(),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to create libp2p host: %v", err)
+    }
 
-	jsonFile, err := os.ReadFile("./solana_wallet_20240718_111115.json")
-	if err != nil {
-		return nil, fmt.Errorf("error reading wallet file: %v", err)
-	}
+    ctx, cancel := context.WithCancel(context.Background())
 
-	var walletInfo struct {
-		PrivateKey string `json:"private_key"`
-	}
-	if err := json.Unmarshal(jsonFile, &walletInfo); err != nil {
-		return nil, fmt.Errorf("error parsing wallet JSON: %v", err)
-	}
+    n := &Node{
+        Host:       h,
+        Peers:      make(map[peer.ID]bool),
+        Keypair:    account,
+        RPCClient:  client.NewClient(rpc.DevnetRPCEndpoint),
+        ctx:        ctx,
+        cancelFunc: cancel,
+    }
 
-	account, err := types.AccountFromBase58(walletInfo.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("invalid private key: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	n := &Node{
-		Host:       h,
-		Peers:      make(map[peer.ID]bool),
-		Keypair:    account,
-		RPCClient:  client.NewClient(rpc.DevnetRPCEndpoint),
-		ctx:        ctx,
-		cancelFunc: cancel,
-	}
-
-	return n, nil
+    return n, nil
 }
 
 func (n *Node) DiscoverPeers() error {
@@ -310,11 +294,44 @@ func (n *Node) checkPeersConnection() {
 	}
 }
 
+func loadWallet(filepath string) (types.Account, error) {
+    jsonFile, err := os.ReadFile(filepath)
+    if err != nil {
+        return types.Account{}, fmt.Errorf("error reading wallet file: %v", err)
+    }
+
+    var walletInfo struct {
+        PrivateKey string `json:"private_key"`
+    }
+    if err := json.Unmarshal(jsonFile, &walletInfo); err != nil {
+        return types.Account{}, fmt.Errorf("error parsing wallet JSON: %v", err)
+    }
+
+    account, err := types.AccountFromBase58(walletInfo.PrivateKey)
+    if err != nil {
+        return types.Account{}, fmt.Errorf("invalid private key: %v", err)
+    }
+
+    return account, nil
+}
+
 func main() {
-	node, err := NewNode()
-	if err != nil {
-		log.Fatalf("Error creating node: %v\n", err)
-	}
+    walletPath := flag.String("wallet", "", "Path to the wallet JSON file")
+    flag.Parse()
+
+    if *walletPath == "" {
+        log.Fatalf("Please specify the wallet JSON file path using -wallet flag")
+    }
+
+    account, err := loadWallet(*walletPath)
+    if err != nil {
+        log.Fatalf("Error loading wallet: %v", err)
+    }
+
+    node, err := NewNode(account)
+    if err != nil {
+        log.Fatalf("Error creating node: %v\n", err)
+    }
 
 	fmt.Printf("Node is running with ID: %s\n", node.Host.ID())
 	fmt.Printf("Solana Public Key: %s\n", node.Keypair.PublicKey.ToBase58())
