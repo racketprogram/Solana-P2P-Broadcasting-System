@@ -23,17 +23,19 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	"github.com/mr-tron/base58"
 )
 
 type Node struct {
-	Host          host.Host
-	Peers         map[peer.ID]bool
-	Leader        peer.ID
-	Keypair       types.Account
-	RPCClient     *client.Client
-	mutex         sync.Mutex
-	ctx           context.Context
-	cancelFunc    context.CancelFunc
+	Host              host.Host
+	Peers             map[peer.ID]bool
+	Leader            peer.ID
+	Keypair           types.Account
+	RPCClient         *client.Client
+	mutex             sync.Mutex
+	ctx               context.Context
+	cancelFunc        context.CancelFunc
+	TransactionHashes []string
 }
 
 func NewNode() (*Node, error) {
@@ -73,12 +75,12 @@ func NewNode() (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	n := &Node{
-		Host:          h,
-		Peers:         make(map[peer.ID]bool),
-		Keypair:       account,
-		RPCClient:     client.NewClient(rpc.DevnetRPCEndpoint),
-		ctx:           ctx,
-		cancelFunc:    cancel,
+		Host:       h,
+		Peers:      make(map[peer.ID]bool),
+		Keypair:    account,
+		RPCClient:  client.NewClient(rpc.DevnetRPCEndpoint),
+		ctx:        ctx,
+		cancelFunc: cancel,
 	}
 
 	return n, nil
@@ -106,8 +108,18 @@ func (d *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	d.node.Peers[pi.ID] = true
 	d.node.mutex.Unlock()
 	log.Printf("Connected to peer: %s\n", pi.ID)
-	
+
 	d.node.ElectLeader()
+}
+
+func (n *Node) GetPeers() []peer.ID {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	peers := make([]peer.ID, 0, len(n.Peers))
+	for peerID := range n.Peers {
+		peers = append(peers, peerID)
+	}
+	return peers
 }
 
 func (n *Node) ElectLeader() {
@@ -153,10 +165,58 @@ func (n *Node) BroadcastMessage(message string) {
 	}
 }
 
-func (n *Node) SignAndSendTransaction(message string) error {
+func (n *Node) BroadcastTransactionHash(hash string) {
+	message := fmt.Sprintf("TXHASH:%s", hash)
+	n.BroadcastMessage(message)
+}
+
+func (n *Node) RecordTransactionHash(hash string) {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	n.TransactionHashes = append(n.TransactionHashes, hash)
+	log.Printf("Recorded transaction hash: %s\n", hash)
+}
+
+func (n *Node) GetAllTransactionHashes() []string {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	return append([]string{}, n.TransactionHashes...)
+}
+
+func (n *Node) GetTransactionDetails(hash string) (string, error) {
+	tx, err := n.RPCClient.GetTransaction(n.ctx, hash)
+	if err != nil {
+		return "", fmt.Errorf("error fetching transaction: %v", err)
+	}
+
+	details := fmt.Sprintf("Transaction: %s\n", hash)
+	details += fmt.Sprintf("Slot: %d\n", tx.Slot)
+	details += fmt.Sprintf("Block Time: %d\n", *tx.BlockTime)
+
+	details += "Accounts:\n"
+	for i, acc := range tx.Transaction.Message.Accounts {
+		details += fmt.Sprintf("  %d. %s\n", i+1, acc.ToBase58())
+	}
+
+	details += "Signers:\n"
+	for i, sig := range tx.Transaction.Signatures {
+		details += fmt.Sprintf("  %d. %s\n", i+1, tx.Transaction.Message.Accounts[i].ToBase58())
+		details += fmt.Sprintf("     Signature: %s\n", base58.Encode(sig[:]))
+	}
+
+	for i, inst := range tx.Transaction.Message.Instructions {
+		details += fmt.Sprintf("Instruction %d:\n", i+1)
+		details += fmt.Sprintf("  Program ID: %s\n", tx.Transaction.Message.Accounts[inst.ProgramIDIndex].ToBase58())
+		details += fmt.Sprintf("  Data: %s\n", inst.Data)
+	}
+
+	return details, nil
+}
+
+func (n *Node) SendMessageAsTransaction(message string) (string, error) {
 	recentBlockhash, err := n.RPCClient.GetLatestBlockhash(n.ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	tx, err := types.NewTransaction(types.NewTransactionParam{
@@ -174,15 +234,15 @@ func (n *Node) SignAndSendTransaction(message string) error {
 		Signers: []types.Account{n.Keypair},
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	sig, err := n.RPCClient.SendTransaction(n.ctx, tx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	log.Printf("Transaction sent: %s\n", sig)
-	return nil
+	return sig, nil
 }
 
 func (n *Node) Run() error {
@@ -199,12 +259,20 @@ func (n *Node) Run() error {
 			return
 		}
 		message := strings.TrimSpace(str)
-		log.Printf("Received message: %s\n", message)
-		
-		if n.Leader == n.Host.ID() {
-			err = n.SignAndSendTransaction(message)
-			if err != nil {
-				log.Printf("Error sending transaction: %v\n", err)
+
+		if strings.HasPrefix(message, "TXHASH:") {
+			hash := strings.TrimPrefix(message, "TXHASH:")
+			n.RecordTransactionHash(hash)
+		} else {
+			log.Printf("Received message: %s\n", message)
+			if n.Leader == n.Host.ID() {
+				hash, err := n.SendMessageAsTransaction(message)
+				if err != nil {
+					log.Printf("Error sending transaction: %v\n", err)
+				} else {
+					n.RecordTransactionHash(hash)
+					n.BroadcastTransactionHash(hash)
+				}
 			}
 		}
 	})
@@ -265,17 +333,53 @@ func main() {
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 
-		if input == "quit" {
+		switch {
+		case input == "quit":
 			node.cancelFunc()
 			return
-		}
-
-		if node.Leader == node.Host.ID() {
-			err := node.SignAndSendTransaction(input)
-			if err != nil {
-				fmt.Printf("Error sending transaction: %v\n", err)
+		case input == "transactions":
+			hashes := node.GetAllTransactionHashes()
+			if len(hashes) == 0 {
+				fmt.Println("No transactions recorded yet.")
+			} else {
+				fmt.Println("Recorded transactions:")
+				for i, hash := range hashes {
+					fmt.Printf("%d. %s\n", i+1, hash)
+				}
 			}
+		case strings.HasPrefix(input, "details "):
+			hash := strings.TrimPrefix(input, "details ")
+			details, err := node.GetTransactionDetails(hash)
+			if err != nil {
+				fmt.Printf("error getting transaction details: %v", err)
+			}
+			fmt.Println(details)
+		case input == "leader":
+			fmt.Printf("Current leader: %s\n", node.Leader)
+			if node.Leader == node.Host.ID() {
+				fmt.Println("This node is the current leader.")
+			}
+		case input == "peers":
+			peers := node.GetPeers()
+			if len(peers) == 0 {
+				fmt.Println("No peers connected.")
+			} else {
+				fmt.Println("Connected peers:")
+				for i, peer := range peers {
+					fmt.Printf("%d. %s\n", i+1, peer)
+				}
+			}
+		default:
+			if node.Leader == node.Host.ID() {
+				hash, err := node.SendMessageAsTransaction(input)
+				if err != nil {
+					fmt.Printf("Error sending transaction: %v\n", err)
+				} else {
+					node.RecordTransactionHash(hash)
+					node.BroadcastTransactionHash(hash)
+				}
+			}
+			node.BroadcastMessage(input)
 		}
-		node.BroadcastMessage(input)
 	}
 }
