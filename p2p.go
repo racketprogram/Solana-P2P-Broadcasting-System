@@ -7,11 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/blocto/solana-go-sdk/client"
 	"github.com/blocto/solana-go-sdk/common"
 	"github.com/blocto/solana-go-sdk/rpc"
@@ -24,59 +23,44 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
-	"github.com/mr-tron/base58"
 )
 
 type Node struct {
-	ID                string
-	Host              host.Host
-	Peers             []peer.ID
-	Leader            peer.ID
-	Round             int
-	Keypair           types.Account
-	RPCClient         *client.Client
-	VotesReceived     map[string]int
-	Proposals         map[string]string
-	QuorumSize        int
-	disconnectedPeers chan peer.ID
-}
-
-type WalletInfo struct {
-	PublicKey  string    `json:"public_key"`
-	PrivateKey string    `json:"private_key"`
-	CreatedAt  time.Time `json:"created_at"`
-	Network    string    `json:"network"`
+	Host          host.Host
+	Peers         map[peer.ID]bool
+	Leader        peer.ID
+	Keypair       types.Account
+	RPCClient     *client.Client
+	mutex         sync.Mutex
+	ctx           context.Context
+	cancelFunc    context.CancelFunc
 }
 
 func NewNode() (*Node, error) {
-    priv, pub, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
-    if err != nil {
-        return nil, fmt.Errorf("failed to generate key pair: %v", err)
-    }
-    
-    pubKeyBytes, _ := pub.Raw()
-    pubKeyString := base58.Encode(pubKeyBytes)
-    log.Printf("Generated new key pair. Public key: %s", pubKeyString)
+	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate key pair: %v", err)
+	}
 
-    h, err := libp2p.New(
-        libp2p.Identity(priv),
-        libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
-        libp2p.Security(noise.ID, noise.New),
-        libp2p.Transport(tcp.NewTCPTransport),
-        libp2p.NATPortMap(),
-    )
-    if err != nil {
-        return nil, fmt.Errorf("failed to create libp2p host: %v", err)
-    }
-
-    log.Printf("Created libp2p host with ID: %s", h.ID())
+	h, err := libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.NATPortMap(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create libp2p host: %v", err)
+	}
 
 	jsonFile, err := os.ReadFile("./solana_wallet_20240718_111115.json")
 	if err != nil {
 		return nil, fmt.Errorf("error reading wallet file: %v", err)
 	}
 
-	var walletInfo WalletInfo
+	var walletInfo struct {
+		PrivateKey string `json:"private_key"`
+	}
 	if err := json.Unmarshal(jsonFile, &walletInfo); err != nil {
 		return nil, fmt.Errorf("error parsing wallet JSON: %v", err)
 	}
@@ -86,122 +70,93 @@ func NewNode() (*Node, error) {
 		return nil, fmt.Errorf("invalid private key: %v", err)
 	}
 
-	n := &Node{
-		ID:                uuid.New().String(),
-		Host:              h,
-		Peers:             make([]peer.ID, 0),
-		Keypair:           account,
-		RPCClient:         client.NewClient(rpc.DevnetRPCEndpoint),
-		VotesReceived:     make(map[string]int),
-		Proposals:         make(map[string]string),
-		QuorumSize:        0,
-		disconnectedPeers: make(chan peer.ID, 100),
-	}
+	ctx, cancel := context.WithCancel(context.Background())
 
-    log.Printf("Node created with ID: %s", n.ID)
-    log.Printf("Node's libp2p host ID: %s", n.Host.ID())
+	n := &Node{
+		Host:          h,
+		Peers:         make(map[peer.ID]bool),
+		Keypair:       account,
+		RPCClient:     client.NewClient(rpc.DevnetRPCEndpoint),
+		ctx:           ctx,
+		cancelFunc:    cancel,
+	}
 
 	return n, nil
 }
 
-func (n *Node) DiscoverPeers(ctx context.Context) error {
-    serviceName := "solana-p2p"
-    log.Printf("Starting mDNS discovery with service name: %s", serviceName)
-    
-    s := mdns.NewMdnsService(n.Host, serviceName, &discoveryNotifee{node: n})
-    return s.Start()
+func (n *Node) DiscoverPeers() error {
+	s := mdns.NewMdnsService(n.Host, "solana-p2p", &discoveryNotifee{node: n})
+	return s.Start()
 }
 
 type discoveryNotifee struct {
 	node *Node
 }
 
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	if pi.ID == n.node.Host.ID() {
+func (d *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == d.node.Host.ID() {
 		return
 	}
-    log.Printf("Found peer: %s", pi.ID)
-	err := n.node.Host.Connect(context.Background(), pi)
+	err := d.node.Host.Connect(d.node.ctx, pi)
 	if err != nil {
 		log.Printf("Error connecting to peer %s: %v\n", pi.ID, err)
 		return
 	}
-	n.node.Peers = append(n.node.Peers, pi.ID)
+	d.node.mutex.Lock()
+	d.node.Peers[pi.ID] = true
+	d.node.mutex.Unlock()
 	log.Printf("Connected to peer: %s\n", pi.ID)
+	
+	d.node.ElectLeader()
 }
 
-func (n *Node) ProposeLeader() {
-    n.Round++
-    if len(n.Peers) > 0 {
-        proposedLeader := n.Peers[n.Round%len(n.Peers)]
-        proposal := fmt.Sprintf("LEADER:%s:%d\n", proposedLeader.String(), n.Round)
-        n.BroadcastMessage(proposal)
-        n.HandleProposal(proposal) // 自己也要处理这个提议
-    } else {
-        n.Leader = n.Host.ID()
-        log.Printf("No peers, self-elected as leader for round %d\n", n.Round)
-    }
+func (n *Node) ElectLeader() {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	if len(n.Peers) == 0 {
+		n.Leader = n.Host.ID()
+		log.Printf("No peers, self-elected as leader")
+		return
+	}
+
+	lowestID := n.Host.ID()
+	for peerID := range n.Peers {
+		if peerID < lowestID {
+			lowestID = peerID
+		}
+	}
+
+	n.Leader = lowestID
+	log.Printf("New leader elected: %s\n", n.Leader)
 }
 
-func (n *Node) HandleProposal(proposal string) {
-    parts := strings.Split(strings.TrimSpace(proposal), ":")
-    if len(parts) != 3 || parts[0] != "LEADER" {
-        log.Printf("Invalid leader proposal format: %s\n", proposal)
-        return
-    }
+func (n *Node) BroadcastMessage(message string) {
+	n.mutex.Lock()
+	peers := make([]peer.ID, 0, len(n.Peers))
+	for peerID := range n.Peers {
+		peers = append(peers, peerID)
+	}
+	n.mutex.Unlock()
 
-    proposedLeader, err := peer.Decode(parts[1])
-    if err != nil {
-        log.Printf("Error decoding proposed leader ID: %v\n", err)
-        return
-    }
-
-    round, err := strconv.Atoi(parts[2])
-    if err != nil {
-        log.Printf("Error parsing round number: %v\n", err)
-        return
-    }
-
-    if round < n.Round {
-        log.Printf("Received outdated leader proposal for round %d, current round is %d\n", round, n.Round)
-        return
-    }
-
-    n.Round = round
-    vote := fmt.Sprintf("VOTE:LEADER:%s:%d\n", proposedLeader.String(), round)
-    n.BroadcastMessage(vote)
-
-    n.VotesReceived[proposal]++
-    if n.VotesReceived[proposal] > n.QuorumSize {
-        n.Leader = proposedLeader
-        log.Printf("New leader elected: %s for round %d\n", n.Leader, n.Round)
-    }
-}
-
-
-func (n *Node) BroadcastMessage(message string) int {
-	receivedCount := 0
-	for _, peerID := range n.Peers {
-		stream, err := n.Host.NewStream(context.Background(), peerID, "/solana/1.0.0")
+	for _, peerID := range peers {
+		stream, err := n.Host.NewStream(n.ctx, peerID, "/solana/1.0.0")
 		if err != nil {
 			log.Printf("Error creating stream to %s: %v\n", peerID, err)
 			continue
 		}
-		_, err = stream.Write([]byte(message))
+		_, err = stream.Write([]byte(message + "\n"))
 		if err != nil {
 			log.Printf("Error sending message to %s: %v\n", peerID, err)
-		} else {
-			receivedCount++
 		}
 		stream.Close()
 	}
-	return receivedCount
 }
 
-func (n *Node) SignMessage(message string) (types.Transaction, error) {
-	recentBlockhash, err := n.RPCClient.GetLatestBlockhash(context.Background())
+func (n *Node) SignAndSendTransaction(message string) error {
+	recentBlockhash, err := n.RPCClient.GetLatestBlockhash(n.ctx)
 	if err != nil {
-		return types.Transaction{}, err
+		return err
 	}
 
 	tx, err := types.NewTransaction(types.NewTransactionParam{
@@ -219,130 +174,19 @@ func (n *Node) SignMessage(message string) (types.Transaction, error) {
 		Signers: []types.Account{n.Keypair},
 	})
 	if err != nil {
-		return types.Transaction{}, err
-	}
-
-	return tx, nil
-}
-
-func (n *Node) ProposeTransaction(message string) {
-    if n.Leader != n.Host.ID() {
-        log.Printf("Only the leader can propose transactions. Current leader: %s\n", n.Leader)
-        return
-    }
-
-	messageWithLeaderID := fmt.Sprintf("%s (Leader: %s)", message, n.Leader)
-
-    tx, err := n.SignMessage(messageWithLeaderID)
-    if err != nil {
-        log.Printf("Error signing message: %v\n", err)
-        return
-    }
-    jsonTx, err := json.Marshal(tx)
-    if err != nil {
-        log.Printf("Error marshaling transaction: %v\n", err)
-        return
-    }
-    proposal := fmt.Sprintf("TX:%s\n", string(jsonTx))
-    n.BroadcastMessage(proposal)
-    n.HandleTransactionProposal(proposal) // 领导者也要处理自己的提议
-}
-
-func (n *Node) HandleTransactionProposal(proposal string) {
-    txData := strings.TrimPrefix(strings.TrimSpace(proposal), "TX:")
-    
-    var tx types.Transaction
-    err := json.Unmarshal([]byte(txData), &tx)
-    if err != nil {
-        log.Printf("Error unmarshaling transaction: %v\n", err)
-        return
-    }
-
-    vote := fmt.Sprintf("VOTE:TX:%s\n", txData)
-    n.BroadcastMessage(vote)
-
-    n.VotesReceived[proposal]++
-	log.Println(n.VotesReceived[proposal], n.QuorumSize)
-    if n.VotesReceived[proposal] >= n.QuorumSize {
-        if n.Leader == n.Host.ID() {
-            err = n.RelayMessage(tx)
-            if err != nil {
-                log.Printf("Error relaying message: %v\n", err)
-            }
-        } else {
-            log.Printf("Transaction proposal reached quorum, waiting for leader to execute")
-        }
-    }
-}
-
-func (n *Node) RelayMessage(tx types.Transaction) error {
-	balance, err := n.RPCClient.GetBalance(context.Background(), n.Keypair.PublicKey.ToBase58())
-	if err != nil {
-		log.Printf("Error getting balance: %v\n", err)
 		return err
 	}
-	log.Printf("Current balance: %d lamports (%.5f SOL)\n", balance, float64(balance)/1e9)
 
-	if balance == 0 {
-		log.Println("Account has no balance. Please fund it using Devnet Faucet.")
-		return fmt.Errorf("insufficient balance")
-	}
-
-	sig, err := n.RPCClient.SendTransaction(context.Background(), tx)
+	sig, err := n.RPCClient.SendTransaction(n.ctx, tx)
 	if err != nil {
-		log.Printf("Error sending transaction: %v\n", err)
 		return err
 	}
 	log.Printf("Transaction sent: %s\n", sig)
 	return nil
 }
 
-func (n *Node) checkPeerConnection(p peer.ID) {
-    if n.Host.Network().Connectedness(p) != network.Connected {
-        log.Printf("Peer %s is no longer connected", p)
-        n.disconnectedPeers <- p
-    }
-}
-
-func (n *Node) removePeer(p peer.ID) {
-    for i, peer := range n.Peers {
-        if peer == p {
-            n.Peers = append(n.Peers[:i], n.Peers[i+1:]...)
-            break
-        }
-    }
-    n.updateQuorumSize()
-    if p == n.Leader {
-        log.Println("Leader disconnected. Initiating new leader election.")
-        n.Leader = ""
-        n.ProposeLeader()
-    }
-}
-
-func (n *Node) updateQuorumSize() {
-    n.QuorumSize = (len(n.Peers) / 2) + 1
-    log.Printf("Updated quorum size to %d", n.QuorumSize)
-}
-
-func (n *Node) monitorPeers() {
-    ticker := time.NewTicker(10 * time.Second)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            for _, p := range n.Peers {
-                go n.checkPeerConnection(p)
-            }
-        case p := <-n.disconnectedPeers:
-            n.removePeer(p)
-        }
-    }
-}
-
 func (n *Node) Run() error {
-	ctx := context.Background()
-	err := n.DiscoverPeers(ctx)
+	err := n.DiscoverPeers()
 	if err != nil {
 		return err
 	}
@@ -354,48 +198,48 @@ func (n *Node) Run() error {
 			log.Printf("Error reading from stream: %v\n", err)
 			return
 		}
-		log.Println(str)
-		n.handleIncomingMessage(strings.TrimSpace(str))
+		message := strings.TrimSpace(str)
+		log.Printf("Received message: %s\n", message)
+		
+		if n.Leader == n.Host.ID() {
+			err = n.SignAndSendTransaction(message)
+			if err != nil {
+				log.Printf("Error sending transaction: %v\n", err)
+			}
+		}
 	})
 
-    go n.monitorPeers()
+	go n.monitorPeers()
 
-	ticker := time.NewTicker(10 * time.Second)
+	return nil
+}
+
+func (n *Node) monitorPeers() {
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-n.ctx.Done():
+			return
 		case <-ticker.C:
-			n.updateQuorumSize()
-			if n.Leader == n.Host.ID() {
-				message := "Hello, Solana!"
-				n.ProposeTransaction(message)
-			} else if n.Leader == "" {
-				n.ProposeLeader()
-			}
+			n.checkPeersConnection()
 		}
 	}
 }
 
-func (n *Node) handleIncomingMessage(message string) {
-    if strings.HasPrefix(message, "LEADER:") {
-        n.HandleProposal(message)
-    } else if strings.HasPrefix(message, "TX:") {
-        n.HandleTransactionProposal(message)
-    } else if strings.HasPrefix(message, "VOTE:") {
-        parts := strings.Split(strings.TrimSpace(message), ":")
-        if len(parts) < 3 {
-            log.Printf("Invalid vote format: %s\n", message)
-            return
-        }
-        if parts[1] == "LEADER" {
-            leaderProposal := fmt.Sprintf("LEADER:%s:%s\n", parts[2], parts[3])
-            n.VotesReceived[leaderProposal]++
-        } else if parts[1] == "TX" {
-            txProposal := fmt.Sprintf("TX:%s\n", strings.Join(parts[2:], ":"))
-            n.VotesReceived[txProposal]++
-        }
-    }
+func (n *Node) checkPeersConnection() {
+	for peerID := range n.Peers {
+		if n.Host.Network().Connectedness(peerID) != network.Connected {
+			log.Printf("Peer %s disconnected\n", peerID)
+			n.mutex.Lock()
+			delete(n.Peers, peerID)
+			n.mutex.Unlock()
+			if peerID == n.Leader {
+				n.ElectLeader()
+			}
+		}
+	}
 }
 
 func main() {
@@ -413,32 +257,25 @@ func main() {
 		}
 	}()
 
+	node.ElectLeader()
+
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("Enter command (peers, leader, balance, quit): ")
-		command, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error reading input:", err)
-			continue
-		}
-		command = strings.TrimSpace(command)
-		switch command {
-		case "peers":
-			fmt.Println("Connected peers:", node.Peers)
-		case "leader":
-			fmt.Println("Current leader:", node.Leader)
-		case "balance":
-			balance, err := node.RPCClient.GetBalance(context.Background(), node.Keypair.PublicKey.ToBase58())
-			if err != nil {
-				fmt.Printf("Error getting balance: %v\n", err)
-			} else {
-				fmt.Printf("Current balance: %d lamports (%.5f SOL)\n", balance, float64(balance)/1e9)
-			}
-		case "quit":
-			fmt.Println("Quitting...")
+		fmt.Print("Enter message (or 'quit' to exit): ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		if input == "quit" {
+			node.cancelFunc()
 			return
-		default:
-			fmt.Println("Unknown command")
 		}
+
+		if node.Leader == node.Host.ID() {
+			err := node.SignAndSendTransaction(input)
+			if err != nil {
+				fmt.Printf("Error sending transaction: %v\n", err)
+			}
+		}
+		node.BroadcastMessage(input)
 	}
 }
