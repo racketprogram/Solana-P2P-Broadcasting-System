@@ -4,7 +4,7 @@ This is a P2P broadcasting system built on the Solana blockchain. It uses libp2p
 
 ## Broadcasting Mechanism
 
-1. Node Discovery: Uses mDNS to automatically discover other nodes on the local network.
+1. Node Discovery: Uses DHT to automatically discover other nodes on the internet.
 2. Leader Election: The node with the lowest ID is elected as the leader.
 3. Message Broadcasting: All nodes can broadcast messages to the network.
 4. Transaction Submission: The leader node submits received messages as transactions to the Solana blockchain.
